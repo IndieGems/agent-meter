@@ -9,8 +9,11 @@
 //! Colours are the terminal's own named ones, never fixed RGB values, so the
 //! interface follows whatever theme the terminal is set to, light or dark.
 
+use std::num::NonZeroU16;
+
 use jiff::Timestamp;
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -38,6 +41,10 @@ const BAR: usize = 28;
 const ACCENT: Color = Color::Cyan;
 /// Everything that supports the text rather than being it.
 const DIM: Color = Color::DarkGray;
+
+/// Names the pieces of the sign-in link as one link, so a terminal that
+/// underlines a link under the pointer underlines every row of it.
+const LINK_ID: &str = "agent-meter-sign-in";
 
 /// Frames of the spinner shown while something runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -772,12 +779,23 @@ fn draw_login(frame: &mut Frame, login: &Login, spinner: &str) {
     }
     lines.push(Line::raw(""));
 
+    // Where on the panel the sign-in link is drawn: the line, the column it
+    // starts at, and the text there.
+    let mut links: Vec<(usize, u16, String)> = Vec::new();
+
     lines.push(label("Sign-in page"));
     match login.link() {
-        Some(link) => lines.push(Line::from(Span::styled(
-            truncate(link, inner),
-            Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
-        ))),
+        // Every character of it, over as many rows as it takes. Over SSH the
+        // browser is on another machine, and this is the only way to it.
+        Some(link) => {
+            for row in wrap(link, inner) {
+                links.push((lines.len(), 0, row.clone()));
+                lines.push(Line::from(Span::styled(
+                    row,
+                    Style::new().fg(ACCENT).add_modifier(Modifier::UNDERLINED),
+                )));
+            }
+        }
         None => lines.push(Line::from(Span::styled(
             format!("Starting {}…", login.provider.display_name()),
             Style::new().fg(DIM),
@@ -811,6 +829,23 @@ fn draw_login(frame: &mut Frame, login: &Login, spinner: &str) {
         lines.push(Line::raw(""));
         lines.push(label("Output"));
         for line in output.iter().skip(output.len().saturating_sub(room)) {
+            // The link is whole above; here it is cut with the rest of the
+            // line, but what is left of it still opens all of it.
+            if let Some(link) = login.link()
+                && let Some(start) = line.find(link)
+            {
+                let before = line[..start].chars().count();
+                let kept = if line.chars().count() > inner {
+                    inner.saturating_sub(1)
+                } else {
+                    inner
+                };
+                let shown: String = link.chars().take(kept.saturating_sub(before)).collect();
+                if !shown.is_empty() {
+                    let column = Span::raw(&line[..start]).width() as u16;
+                    links.push((lines.len(), column, shown));
+                }
+            }
             lines.push(Line::from(Span::styled(
                 truncate(line, inner),
                 Style::new().fg(Color::Gray),
@@ -823,8 +858,72 @@ fn draw_login(frame: &mut Frame, login: &Login, spinner: &str) {
         None => format!("Log in to a new {} account", login.provider.display_name()),
     };
     let area = popup(screen, limit.width, (lines.len() + frame_lines) as u16);
+    let block = dialog(&title);
+    let text = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).block(dialog(&title)), area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(link) = login.link() {
+        for (line, column, shown) in links {
+            hyperlink(frame.buffer_mut(), text, line, column, &shown, link);
+        }
+    }
+}
+
+/// Makes `text`, already drawn at `column` of `line` within `area`, a link to
+/// `url`, so that clicking any part of it opens the whole page: the terminal is
+/// told where the link goes (OSC 8), which reaches the machine the user sits
+/// at even when this one is at the other end of an SSH connection. Terminals
+/// that do not know the sequence ignore it and show the text as it is.
+///
+/// Only cells that changed are written to the terminal, and one written on its
+/// own would lose the link, so the text goes out as a single piece carried by
+/// its first cell. The cells after it keep their characters, so what is on
+/// screen there is still known when something else is drawn over it.
+fn hyperlink(buffer: &mut Buffer, area: Rect, line: usize, column: u16, text: &str, url: &str) {
+    let Ok(line) = u16::try_from(line) else {
+        return;
+    };
+    let width = Span::raw(text).width() as u16;
+    // Cut off by a window too small for the panel.
+    if line >= area.height || column.saturating_add(width) > area.width {
+        return;
+    }
+    let Some(width) = NonZeroU16::new(width) else {
+        return;
+    };
+    if let Some(cell) = buffer.cell_mut((area.x + column, area.y + line)) {
+        cell.set_symbol(&format!(
+            "\u{1b}]8;id={LINK_ID};{url}\u{1b}\\{text}\u{1b}]8;;\u{1b}\\"
+        ))
+        .set_diff_option(CellDiffOption::ForcedWidth(width));
+    }
+}
+
+/// What `buffer` shows, a line of text for each row, as a terminal draws it.
+pub fn screen_text(buffer: &Buffer) -> String {
+    let area = buffer.area;
+    (area.y..area.bottom())
+        .map(|y| {
+            let mut row = String::new();
+            let mut x = area.x;
+            while x < area.right() {
+                let cell = &buffer[(x, y)];
+                match cell.diff_option {
+                    // A cell carrying a piece of text written out in one go.
+                    CellDiffOption::ForcedWidth(width) => {
+                        row.push_str(&login::strip_escapes(cell.symbol()));
+                        x = x.saturating_add(width.get());
+                    }
+                    _ => {
+                        row.push_str(cell.symbol());
+                        x += 1;
+                    }
+                }
+            }
+            row.trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A dialog's frame: rounded, in the accent colour, with room inside.
@@ -861,17 +960,7 @@ mod tests {
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        screen_text(terminal.backend().buffer())
     }
 
     fn window(secs: u64, scope: Option<&str>, used: f64, resets_in: i64) -> Window {
@@ -1145,6 +1234,10 @@ mod tests {
                 render(&mut app, width, height);
             }
         }
+        let mut app = signing_in();
+        for (width, height) in [(1u16, 1u16), (20, 5), (40, 10), (200, 60)] {
+            render(&mut app, width, height);
+        }
     }
 
     #[test]
@@ -1164,6 +1257,130 @@ mod tests {
         assert!(header.contains("All 3"), "{header}");
         assert!(header.contains("Claude Code 2"), "{header}");
         assert!(header.contains("Codex 1"), "{header}");
+    }
+
+    /// The sign-in link as Claude Code prints it: a few hundred characters,
+    /// far wider than any panel.
+    const SIGN_IN: &str = "https://claude.com/cai/oauth/authorize?code=true\
+        &client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code\
+        &redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback\
+        &scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference\
+        +user%3Asessions%3Aclaude_code+user%3Amcp_servers\
+        &code_challenge=Xq3VbP0n9sJ2kLmR7tYw4uZc8eHf1gAdOiNpQrStUvW\
+        &code_challenge_method=S256&state=Kj8mN2bV5cX7zA1sD4fG6hJ9kL0qW3eR5tY7uI9oP1a";
+
+    fn signing_in() -> App {
+        let mut app = App::for_tests(crate::tui::app::sample_statuses(1));
+        app.mode = Mode::Login;
+        app.login = Some(Login::printed(
+            ProviderKind::Claude,
+            &format!(
+                "Opening browser to sign in…\nIf the browser didn't open, visit: \
+                 \u{1b}]8;;{SIGN_IN}\u{7}{SIGN_IN}\u{1b}]8;;\u{7}\nPaste code here if prompted > "
+            ),
+        ));
+        app
+    }
+
+    /// Over SSH the browser that has to open the link is on another machine,
+    /// so the link on screen is the only way to it: every character of it is
+    /// shown, however narrow the window.
+    #[test]
+    fn the_sign_in_link_is_shown_whole() {
+        let mut app = signing_in();
+        for width in [60u16, 80, 110, 200] {
+            let screen = render(&mut app, width, 40);
+            // The panel's rows, without its borders, joined back up.
+            let shown: String = screen
+                .lines()
+                .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+                .collect();
+            assert!(shown.contains(SIGN_IN), "at {width}:\n{screen}");
+        }
+    }
+
+    /// Clicking any piece of the link — a row of it, or the part of the CLI's
+    /// own line that fits — opens the whole page, and the link ends where
+    /// the piece does, so nothing drawn after it opens the page too.
+    #[test]
+    fn every_piece_of_the_link_opens_all_of_it() {
+        let mut app = signing_in();
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let open = format!("\u{1b}]8;id={LINK_ID};{SIGN_IN}\u{1b}\\");
+        let close = "\u{1b}]8;;\u{1b}\\";
+        let pieces: Vec<&str> = buffer
+            .content()
+            .iter()
+            .filter(|cell| matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)))
+            .map(|cell| {
+                let text = cell.symbol();
+                assert!(text.starts_with(&open) && text.ends_with(close), "{text:?}");
+                &text[open.len()..text.len() - close.len()]
+            })
+            .collect();
+
+        // The rows of the sign-in page, then what fits of the CLI's line.
+        let (output, rows) = pieces.split_last().unwrap();
+        assert!(rows.len() > 1, "{pieces:?}");
+        assert_eq!(rows.concat(), SIGN_IN);
+        assert!(SIGN_IN.starts_with(output) && output.len() > 8, "{output:?}");
+    }
+
+    /// What the terminal is actually sent: each row of the link wrapped in its
+    /// own link sequence, and once the panel is up, the frames that follow
+    /// leave the link alone rather than half-rewriting it.
+    #[test]
+    fn the_terminal_is_sent_the_link_whole() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// Keeps what is written to it, for reading back.
+        #[derive(Clone, Default)]
+        struct Recorder(Rc<RefCell<Vec<u8>>>);
+        impl std::io::Write for Recorder {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let recorder = Recorder::default();
+        let drain = || String::from_utf8(recorder.0.take()).unwrap();
+
+        let mut app = signing_in();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(recorder.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 40)),
+            },
+        )
+        .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let sent = drain();
+
+        let open = format!("\u{1b}]8;id={LINK_ID};{SIGN_IN}\u{1b}\\");
+        let close = "\u{1b}]8;;\u{1b}\\";
+        let mut rows = String::new();
+        for piece in sent.split(&open).skip(1) {
+            let (text, _) = piece.split_once(close).expect("every link is closed");
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            rows.push_str(text);
+        }
+        assert!(rows.starts_with(SIGN_IN), "{rows:?}");
+
+        // The next frame differs only in the clock and the spinner.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let sent = drain();
+        assert!(!sent.contains("]8;"), "{sent:?}");
+        assert!(!sent.contains("oauth"), "{sent:?}");
     }
 
     #[test]

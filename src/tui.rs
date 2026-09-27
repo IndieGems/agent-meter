@@ -26,16 +26,5 @@ pub fn screenshot(engine: &Engine, width: u16, height: u16, watching: bool) -> R
     let mut app = app::App::preview(engine, watching)?;
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(|frame| draw::draw(frame, &mut app))?;
-
-    let buffer = terminal.backend().buffer().clone();
-    Ok((0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+    Ok(draw::screen_text(terminal.backend().buffer()))
 }

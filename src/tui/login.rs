@@ -208,6 +208,29 @@ impl Drop for Login {
     }
 }
 
+#[cfg(test)]
+impl Login {
+    /// A login still waiting for the user, that has printed `output`, for
+    /// drawing without a CLI behind it.
+    pub fn printed(provider: ProviderKind, output: &str) -> Self {
+        let (_, events) = channel();
+        let mut transcript = Transcript::default();
+        transcript.push(output);
+        Self {
+            provider,
+            account: None,
+            state: State::Running,
+            input: String::new(),
+            started: Instant::now(),
+            transcript,
+            events,
+            stdin: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        }
+    }
+}
+
 /// Runs the login CLI with every stream piped to us, until it exits or the
 /// user cancels.
 fn run_piped(
@@ -319,11 +342,16 @@ struct Transcript {
     /// Windows ends a line, and before anything else it rewrites the line, as
     /// a spinner does. The two halves of `\r\n` can arrive in separate reads.
     carriage_return: bool,
+    /// Where the escape sequence being read has got to. A sequence can arrive
+    /// split across reads too, and the hyperlink wrapper round Claude Code's
+    /// link holds the whole address: were its second half taken for text, the
+    /// address would be printed where it should not be, or doubled.
+    escape: Escape,
 }
 
 impl Transcript {
     fn push(&mut self, text: &str) {
-        for c in strip_escapes(text).chars() {
+        for c in text.chars().filter(|&c| self.escape.is_text(c)) {
             if std::mem::take(&mut self.carriage_return) && c != '\n' {
                 self.partial.clear();
             }
@@ -362,43 +390,52 @@ impl Transcript {
     }
 }
 
+/// How far into a terminal escape sequence the text read so far is.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum Escape {
+    /// Not in one: this is text.
+    #[default]
+    None,
+    /// Just after the escape character.
+    Started,
+    /// A control sequence: parameters, then one final byte.
+    Control,
+    /// An operating system command, which runs to a bell or to ESC \.
+    Command,
+    /// An escape character inside a command, which may be ending it.
+    CommandEnding,
+}
+
+impl Escape {
+    /// Takes the next character, and says whether it is text rather than
+    /// part of a sequence.
+    fn is_text(&mut self, c: char) -> bool {
+        const ESC: char = '\u{1b}';
+        const BEL: char = '\u{7}';
+        *self = match (*self, c) {
+            (Self::None, ESC) => Self::Started,
+            (Self::None, _) => return true,
+            (Self::Started, '[') => Self::Control,
+            (Self::Started, ']') => Self::Command,
+            // Any other escape is two characters long.
+            (Self::Started, _) => Self::None,
+            (Self::Control, '\u{40}'..='\u{7e}') => Self::None,
+            (Self::Control, _) => Self::Control,
+            (Self::Command | Self::CommandEnding, BEL) => Self::None,
+            (Self::Command | Self::CommandEnding, ESC) => Self::CommandEnding,
+            (Self::CommandEnding, '\\') => Self::None,
+            (Self::Command | Self::CommandEnding, _) => Self::Command,
+        };
+        false
+    }
+}
+
 /// Removes terminal escape sequences: colours, cursor movement, and the
 /// hyperlink wrapper Claude Code puts round its link, which would otherwise
 /// print the address twice.
-fn strip_escapes(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            // Control sequence: parameters, then one final byte.
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // Operating system command: runs to a bell or to ESC \.
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            // Any other escape is two characters long.
-            _ => {}
-        }
-    }
-    out
+pub(super) fn strip_escapes(text: &str) -> String {
+    let mut escape = Escape::None;
+    text.chars().filter(|&c| escape.is_text(c)).collect()
 }
 
 /// Opens `url` in the user's browser.
@@ -483,6 +520,23 @@ mod tests {
             transcript.link(),
             Some("https://auth.openai.com/oauth/authorize?response_type=code&state=y")
         );
+    }
+
+    /// A read can end anywhere, including inside the hyperlink wrapper that
+    /// carries the whole address; wherever it ends, the text and the link
+    /// come out the same.
+    #[test]
+    fn output_split_anywhere_reads_the_same() {
+        let mut whole = Transcript::default();
+        whole.push(CLAUDE);
+        let chars: Vec<char> = CLAUDE.chars().collect();
+        for at in 0..=chars.len() {
+            let mut split = Transcript::default();
+            split.push(&chars[..at].iter().collect::<String>());
+            split.push(&chars[at..].iter().collect::<String>());
+            assert_eq!(split.lines(), whole.lines(), "split at {at}");
+            assert_eq!(split.link(), whole.link(), "split at {at}");
+        }
     }
 
     #[test]

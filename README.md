@@ -224,6 +224,9 @@ Logging in never leaves the interface. `a` and `l` run the agent CLI's own
 login in the background and show it in a panel: the sign-in page opens in your
 browser (`o` opens it again, `y` copies the link), and if the page hands back a
 code instead of finishing by itself, paste it into the panel and press `enter`.
+The link is shown in full and is clickable in terminals that support
+hyperlinks, so over ssh it opens in the browser on the machine you are sitting
+at.
 `esc` stops the login, and nothing is stored unless it finishes.
 
 ## JSON usage feed
