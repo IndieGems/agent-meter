@@ -19,7 +19,7 @@ use crate::store::{Store, SwitchRecord, UsageCache};
 use crate::usage::Usage;
 
 /// Refresh an access token this long before it expires, so a poll never races
-/// the expiry.
+/// the expiry. Only for accounts no agent CLI is using: see [`renewal_due`].
 const REFRESH_LEEWAY: SignedDuration = SignedDuration::from_mins(10);
 
 /// How long a login directory may sit before it is assumed to be the remains of
@@ -679,6 +679,14 @@ impl Engine {
                     .context("giving the newer credential to the agent CLI")?;
             }
         } else {
+            // The CLI renewed it. Polls that failed were failing with the
+            // credential this replaces, and their backoff would hold the new
+            // one out of the next poll.
+            if live.credential.refresh_token != account.credential.refresh_token {
+                let mut cache = self.store.usage_cache()?;
+                cache.clear_failure(&account.id);
+                self.store.put_usage_cache(&cache)?;
+            }
             let mut updated = account.clone();
             updated.credential = live.credential;
             updated.identity.update_from(&live.identity);
@@ -848,14 +856,17 @@ impl Engine {
         }
         let mut credential = account.credential.clone();
 
-        if expires_within(&credential, REFRESH_LEEWAY) {
+        if renewal_due(&credential, active) {
             credential = self.refresh_and_store(provider, account, active)?;
         }
 
         match provider.fetch_usage(&credential) {
-            Err(http::Error::Unauthorized { .. }) => {
-                // The token was rejected even though it looked current; one
-                // refresh is worth trying before declaring the account dead.
+            // The token was rejected even though it looked current; one
+            // refresh is worth trying before declaring the account dead. Not
+            // for the account in use: the CLI was sent the same refusal, and
+            // renewing is its answer to give. Its new credential is adopted
+            // at the next poll.
+            Err(http::Error::Unauthorized { .. }) if !active => {
                 let credential = self.refresh_and_store(provider, account, active)?;
                 provider.fetch_usage(&credential)
             }
@@ -1152,6 +1163,28 @@ fn entitlement_due(account: &Account, active: bool, now: Timestamp) -> bool {
     account.identity.plan.is_none() || active
 }
 
+/// Whether agent-meter should renew a credential before polling with it.
+///
+/// Refresh tokens are single-use, so two parties renewing one account race,
+/// and the loser holds a spent token that ends in `invalid_grant`. While an
+/// agent CLI is using an account, renewing it is the CLI's job: it does so as
+/// it works, and agent-meter adopts the result. Stepping in ahead of it — as a
+/// ten-minute margin did, when Claude Code renews at five — rotates the token
+/// out from under a running session.
+///
+/// Once the token has actually expired, though, a working CLI would already
+/// have renewed it, so nobody is: the CLI is idle, closed, or was refused. Then
+/// agent-meter renews it, which is also how a signed-out account in use comes
+/// to light at all.
+fn renewal_due(credential: &Credential, in_use: bool) -> bool {
+    let leeway = if in_use {
+        SignedDuration::ZERO
+    } else {
+        REFRESH_LEEWAY
+    };
+    expires_within(credential, leeway)
+}
+
 /// Whether a credential expires within `leeway`.
 pub(crate) fn expires_within(credential: &Credential, leeway: SignedDuration) -> bool {
     credential
@@ -1379,6 +1412,31 @@ mod tests {
                 "the spent token's clock must not be carried forward: {response}"
             );
         }
+    }
+
+    /// A ten-minute margin had agent-meter renew the account Claude Code was
+    /// using before Claude Code did, rotating the refresh token out from under
+    /// a running session.
+    #[test]
+    fn the_account_in_use_is_renewed_only_once_its_cli_has_let_it_expire() {
+        let expiring_in = |minutes: i64| Credential {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            id_token: None,
+            expires_at: Some(Timestamp::now() + SignedDuration::from_mins(minutes)),
+            refresh_expires_at: None,
+        };
+
+        // Close to expiry: the CLI's to renew, and ours for anything else.
+        assert!(!renewal_due(&expiring_in(7), true));
+        assert!(renewal_due(&expiring_in(7), false));
+
+        // Expired: a working CLI would have renewed it, so nobody is.
+        assert!(renewal_due(&expiring_in(-1), true));
+
+        // Nowhere near: nobody renews.
+        assert!(!renewal_due(&expiring_in(60), true));
+        assert!(!renewal_due(&expiring_in(60), false));
     }
 
     /// One rate for every provider was Anthropic's rate applied to a provider

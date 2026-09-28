@@ -1037,6 +1037,43 @@ fn watch_moves_claude_code_off_an_account_the_provider_signed_out() {
     );
 }
 
+/// agent-meter leaves renewing the account in use to its CLI, so the CLI's
+/// renewal is what ends a run of failed polls. The backoff those failures set
+/// must not hold the new credential out until it lapses.
+#[test]
+fn a_renewal_by_the_cli_ends_the_backoff_its_old_credential_earned() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("dev@example.com", "uuid-1", "old");
+    fixture.run(&["import", "claude"]);
+
+    let now = jiff::Timestamp::now();
+    let cache = fixture.data.join("usage.json");
+    write_json(
+        &cache,
+        &json!({"entries": {"claude-1": {
+            "error": "token expired",
+            "failed_at": now,
+            "retry_after": now + jiff::SignedDuration::from_mins(30),
+            "failures": 3,
+        }}}),
+    );
+
+    // Claude Code renews: a new refresh token, expiring later.
+    fixture.sign_in_claude_expiring("dev@example.com", "uuid-1", "new", 1_950_000_000_000);
+    fixture.run(&["watch", "--once", "--dry-run"]);
+
+    // Polled again at once rather than half an hour later. Tests are offline,
+    // so that poll's own failure is the evidence it happened.
+    let entry = &read_json(&cache)["entries"]["claude-1"];
+    assert_eq!(entry["failures"], 1, "{entry}");
+    assert!(entry["error"].as_str().unwrap().contains("offline"), "{entry}");
+    assert_eq!(
+        fixture.accounts()[0]["id"],
+        "claude-1",
+        "the renewal is the same account, not a new one"
+    );
+}
+
 #[test]
 fn an_api_key_login_is_refused_with_an_explanation() {
     let fixture = Fixture::new();
