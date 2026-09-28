@@ -53,10 +53,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // The keys keep a line of their own. Sharing it with whatever just
     // happened meant that every time something happened, the way to do the
     // next thing disappeared.
-    let [header, rule, body, message, keys] = Layout::vertical([
+    let [header, rule, body, message, keys, version] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -70,6 +71,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_body(frame, body, app);
     draw_message(frame, message, app);
     draw_keys(frame, keys, app);
+    draw_version(frame, version);
 
     if app.mode != Mode::Browse {
         // The footer stays lit: it holds the keys for the dialog.
@@ -657,6 +659,17 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Which build this is, out of the way in the corner: the first thing asked
+/// when something behaves differently on two machines.
+fn draw_version(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(format!("v{} ", env!("CARGO_PKG_VERSION")))
+            .style(Style::new().fg(DIM))
+            .alignment(Alignment::Right),
+        area,
+    );
+}
+
 fn draw_help(frame: &mut Frame) {
     let row = |key: &'static str, what: &'static str| {
         Line::from(vec![
@@ -1238,6 +1251,23 @@ mod tests {
         for (width, height) in [(1u16, 1u16), (20, 5), (40, 10), (200, 60)] {
             render(&mut app, width, height);
         }
+    }
+
+    #[test]
+    fn the_version_sits_in_the_bottom_right_corner_below_the_keys() {
+        let screen = render(&mut App::for_tests(crate::tui::app::sample_statuses(2)), 100, 20);
+        let lines: Vec<&str> = screen.lines().collect();
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let last = lines.last().unwrap();
+        assert!(last.trim_end().ends_with(&version), "{screen}");
+        assert!(
+            last.trim_start().starts_with(&version),
+            "nothing else shares its line: {screen}"
+        );
+        assert!(
+            lines[lines.len() - 2].contains("enter use"),
+            "the keys are just above it: {screen}"
+        );
     }
 
     #[test]
