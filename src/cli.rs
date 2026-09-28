@@ -1239,6 +1239,9 @@ fn describe(decision: &Decision, dry_run: bool) -> String {
                 Reason::ActiveExhausted { target_used } => {
                     format!("out of quota; {to} is at {target_used:.0}%")
                 }
+                Reason::ActiveSignedOut { target_used } => {
+                    format!("the provider signed this account out; {to} is at {target_used:.0}%")
+                }
                 Reason::WeekExpiresSooner { target_used } => format!(
                     "{to}'s weekly allowance resets sooner, so spending it first wastes \
                      nothing; it is at {target_used:.0}% and switching interrupts nothing"

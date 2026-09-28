@@ -984,6 +984,59 @@ fn watch_reports_what_it_would_do_without_changing_anything() {
     );
 }
 
+/// The account in use had its refresh token rejected (`invalid_grant`) while
+/// its last reading was well under the threshold. The watcher judged it on that
+/// reading, "stayed put", and left Claude Code signed out.
+#[test]
+fn watch_moves_claude_code_off_an_account_the_provider_signed_out() {
+    let fixture = Fixture::new();
+    fixture.sign_in_claude("spare@example.com", "uuid-spare", "spare");
+    fixture.run(&["import", "claude"]);
+    fixture.sign_in_claude("dead@example.com", "uuid-dead", "dead");
+    fixture.run(&["import", "claude"]);
+
+    // Mark it the way a rejected refresh does.
+    let record = fixture.data.join("accounts").join("claude-2.json");
+    let mut stored: Value = read_json(&record);
+    stored["needs_login"] = json!("the provider rejected its credential: invalid_grant");
+    write_json(&record, &stored);
+
+    let now = jiff::Timestamp::now();
+    let reading = |used: f64| {
+        json!({
+            "observed_at": now,
+            "windows": [{
+                "window_secs": 18000,
+                "used_percent": used,
+                "resets_at": now + jiff::SignedDuration::from_hours(3),
+            }],
+            "limit_reached": false,
+        })
+    };
+    write_json(
+        &fixture.data.join("usage.json"),
+        &json!({"entries": {
+            "claude-1": {"usage": reading(10.0), "failures": 0},
+            "claude-2": {"usage": reading(40.0), "failures": 0},
+        }}),
+    );
+    // A switch moments ago does not hold it there: there is nothing to flap to.
+    write_json(
+        &fixture.data.join("state.json"),
+        &json!({"last_switch": {"claude": {
+            "at": now - jiff::SignedDuration::from_secs(60),
+            "to": "claude-2",
+        }}}),
+    );
+
+    let output = fixture.run(&["watch", "--once"]);
+    assert!(output.contains("claude-2 -> claude-1"), "{output}");
+    assert_eq!(
+        fixture.claude_credentials()["claudeAiOauth"]["refreshToken"],
+        "sk-ant-ort01-spare"
+    );
+}
+
 #[test]
 fn an_api_key_login_is_refused_with_an_explanation() {
     let fixture = Fixture::new();

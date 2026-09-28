@@ -103,6 +103,9 @@ pub enum Reason {
     BestOfExhausted { used: f64, target_used: f64 },
     /// The active account is refusing requests outright.
     ActiveExhausted { target_used: f64 },
+    /// The provider rejected the active account's credential, so the agent is
+    /// signed out and nothing it asks for will be served until it moves.
+    ActiveSignedOut { target_used: f64 },
     /// Nothing is wrong with the account in use, but another account's weekly
     /// allowance expires sooner and would otherwise be thrown away unspent.
     /// Only taken where a switch interrupts nothing.
@@ -132,6 +135,13 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
     let Some(active) = candidates.iter().find(|c| c.active) else {
         return Decision::Stay(Stay::NoActiveAccount);
     };
+    // Checked before anything about usage, because none of it applies: an
+    // account whose credential the provider has rejected does no work at all,
+    // whatever its last reading said, and a reading may not exist precisely
+    // because the rejection stopped the polls.
+    if !active.usable {
+        return leave_signed_out(candidates, rules, now);
+    }
     // Deliberately not gated on age. The account being used up is the one that
     // gets hammered, so it is the first the provider rate-limits — and if a
     // failed poll made it unreadable rather than spent, switching would stop
@@ -232,28 +242,74 @@ pub fn decide(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> De
                 reason,
             }
         }
-        None => {
-            let alternatives: Vec<_> = candidates
-                .iter()
-                .filter(|c| !c.active && c.usable)
-                .filter_map(|c| Some((c, fresh(c, rules, now)?)))
-                .collect();
-            if alternatives.is_empty() {
-                return Decision::Blocked(Blocked::NoAlternative);
-            }
-            // Every alternative is exhausted; report when the first one recovers
-            // so the caller can wait rather than give up.
-            let soonest = alternatives
-                .iter()
-                .chain(std::iter::once(&(active, active_usage)))
-                .filter_map(|(c, usage)| Some((c.id, usage.next_relief(now)?)))
-                .min_by_key(|(_, at)| *at);
-            Decision::Blocked(Blocked::AllExhausted {
-                relief_at: soonest.map(|(_, at)| at),
-                relief_account: soonest.map(|(id, _)| id.to_string()),
-            })
-        }
+        None => nowhere_to_go(candidates, Some((active, active_usage)), rules, now),
     }
+}
+
+/// Decides where to go from an account the provider has signed out.
+///
+/// Not a choice between loads, because staying is not one of the options:
+/// every request the agent makes fails until it is on another account. So the
+/// threshold does not apply, and neither does the reluctance to restart
+/// sessions, which are already stopped. What is left is the ranking itself —
+/// the account the watcher would take next anyway.
+fn leave_signed_out(candidates: &[Candidate<'_>], rules: &Rules, now: Timestamp) -> Decision {
+    let mut usable: Vec<(&Candidate<'_>, &Usage)> = candidates
+        .iter()
+        .filter(|c| !c.active && c.usable)
+        .filter_map(|c| Some((c, fresh(c, rules, now)?)))
+        .filter(|(_, usage)| !usage.is_exhausted_at(now))
+        .collect();
+    // The account being left has no quota worth comparing against, so only the
+    // accounts on offer decide whether sizes can be weighed.
+    let weighted = usable.iter().all(|(c, _)| c.capacity.is_some());
+    let remaining =
+        |candidate: &Candidate<'_>, usage: &Usage| usage.headroom_at(now) * weight(candidate, weighted);
+    rank(&mut usable, rules, now, &remaining);
+
+    match usable.first() {
+        Some((candidate, usage)) => Decision::Switch {
+            to: candidate.id.to_string(),
+            reason: Reason::ActiveSignedOut {
+                target_used: usage.used_at(now),
+            },
+        },
+        // A signed-out account never frees up by waiting, so it is no part of
+        // when relief arrives.
+        None => nowhere_to_go(candidates, None, rules, now),
+    }
+}
+
+/// Why a wanted switch has no account to go to.
+///
+/// `active` joins the accounts whose recovery is reported when waiting it out
+/// is one of the ways relief can come.
+fn nowhere_to_go(
+    candidates: &[Candidate<'_>],
+    active: Option<(&Candidate<'_>, &Usage)>,
+    rules: &Rules,
+    now: Timestamp,
+) -> Decision {
+    let alternatives: Vec<_> = candidates
+        .iter()
+        .filter(|c| !c.active && c.usable)
+        .filter_map(|c| Some((c, fresh(c, rules, now)?)))
+        .collect();
+    if alternatives.is_empty() {
+        return Decision::Blocked(Blocked::NoAlternative);
+    }
+    // Every alternative is exhausted; report when the first one recovers so the
+    // caller can wait rather than give up.
+    let soonest = alternatives
+        .iter()
+        .copied()
+        .chain(active)
+        .filter_map(|(c, usage)| Some((c.id, usage.next_relief(now)?)))
+        .min_by_key(|(_, at)| *at);
+    Decision::Blocked(Blocked::AllExhausted {
+        relief_at: soonest.map(|(_, at)| at),
+        relief_account: soonest.map(|(id, _)| id.to_string()),
+    })
 }
 
 /// Puts the accounts worth switching to in the order they would be taken.
@@ -729,6 +785,97 @@ mod tests {
             now(),
         );
         assert_eq!(decision, Decision::Blocked(Blocked::NoAlternative));
+    }
+
+    /// A rejected credential used to be judged on its last reading, so an
+    /// account signed out at 40% "stayed put" and the agent stayed down.
+    #[test]
+    fn a_signed_out_active_account_is_left_whatever_its_last_reading() {
+        let signed_out = |usage| Candidate {
+            usable: false,
+            ..candidate("claude-1", usage, true)
+        };
+        let (below, other) = (usage(40.0), usage(60.0));
+        // Where a switch costs a restart too: the sessions are already stopped.
+        for rules in [Rules::default(), seamless()] {
+            for last_reading in [Some(&below), None] {
+                assert_eq!(
+                    decide(
+                        &[
+                            signed_out(last_reading),
+                            candidate("claude-2", Some(&other), false)
+                        ],
+                        &rules,
+                        now()
+                    ),
+                    Decision::Switch {
+                        to: "claude-2".into(),
+                        reason: Reason::ActiveSignedOut { target_used: 60.0 },
+                    },
+                    "{rules:?} with {last_reading:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_signed_out_active_account_goes_where_the_watcher_would_go_next() {
+        let (dead, busy, roomy) = (usage(10.0), usage(95.0), usage(20.0));
+        let decision = decide(
+            &[
+                Candidate {
+                    usable: false,
+                    ..candidate("claude-1", Some(&dead), true)
+                },
+                candidate("claude-2", Some(&busy), false),
+                candidate("claude-3", Some(&roomy), false),
+            ],
+            &Rules::default(),
+            now(),
+        );
+        assert_eq!(
+            decision,
+            Decision::Switch {
+                to: "claude-3".into(),
+                reason: Reason::ActiveSignedOut { target_used: 20.0 },
+            }
+        );
+    }
+
+    #[test]
+    fn a_signed_out_active_account_with_nowhere_to_go_is_blocked() {
+        let dead = usage(10.0);
+        let signed_out = Candidate {
+            usable: false,
+            ..candidate("claude-1", Some(&dead), true)
+        };
+        assert_eq!(
+            decide(std::slice::from_ref(&signed_out), &Rules::default(), now()),
+            Decision::Blocked(Blocked::NoAlternative)
+        );
+
+        // Its own reset is no relief: only another account's is.
+        let mut spent = usage(100.0);
+        spent.windows[0].resets_at = Timestamp::from_second(NOW + 1800).ok();
+        let mut dead_soon = usage(10.0);
+        dead_soon.windows[0].resets_at = Timestamp::from_second(NOW + 60).ok();
+        assert_eq!(
+            decide(
+                &[
+                    Candidate {
+                        usage: Some(&dead_soon),
+                        ..signed_out
+                    },
+                    candidate("claude-2", Some(&spent), false)
+                ],
+                &Rules::default(),
+                now()
+            ),
+            Decision::Blocked(Blocked::AllExhausted {
+                relief_at: Timestamp::from_second(NOW + 1800).ok(),
+                relief_account: Some("claude-2".into()),
+            })
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::account::{Account, Captured, Credential, Match, ProviderKind, SCHEMA_VERSION, same_identity};
 use crate::config::Config;
 use crate::http;
-use crate::policy::{self, Candidate, Decision, Disruption, Rules};
+use crate::policy::{self, Candidate, Decision, Disruption, Reason, Rules};
 use crate::provider::{self, Provider};
 use crate::remote::Report;
 use crate::store::{Store, SwitchRecord, UsageCache};
@@ -1006,7 +1006,14 @@ impl Engine {
 
             let (switched, held) = match &decision {
                 Decision::Switch { .. } if !act => (None, None),
-                Decision::Switch { to, .. } => match self.cooldown_remaining(kind, now)? {
+                Decision::Switch { to, reason } => match self.cooldown_remaining(kind, now)? {
+                    // The cooldown keeps two workable accounts from being
+                    // traded back and forth. A signed-out one can never be
+                    // switched back to, so there is nothing to flap between,
+                    // and every minute waited is a minute the agent is down.
+                    _ if matches!(reason, Reason::ActiveSignedOut { .. }) => {
+                        (Some(self.switch_and_record(kind, to, now)?), None)
+                    }
                     Some(remaining) => (
                         None,
                         Some(format!(
@@ -1014,20 +1021,7 @@ impl Engine {
                             crate::timefmt::duration(remaining.as_secs())
                         )),
                     ),
-                    None => {
-                        let outcome = self.switch_to(to)?;
-                        let mut state = self.store.state()?;
-                        state.record_switch(
-                            kind,
-                            SwitchRecord {
-                                at: now,
-                                to: outcome.to.clone(),
-                                from: outcome.from.clone(),
-                            },
-                        );
-                        self.store.put_state(&state)?;
-                        (Some(outcome), None)
-                    }
+                    None => (Some(self.switch_and_record(kind, to, now)?), None),
                 },
                 _ => (None, None),
             };
@@ -1039,6 +1033,22 @@ impl Engine {
             });
         }
         Ok(outcomes)
+    }
+
+    /// Makes an automatic switch and notes it, so the cooldown counts from here.
+    fn switch_and_record(&self, kind: ProviderKind, to: &str, now: Timestamp) -> Result<SwitchOutcome> {
+        let outcome = self.switch_to(to)?;
+        let mut state = self.store.state()?;
+        state.record_switch(
+            kind,
+            SwitchRecord {
+                at: now,
+                to: outcome.to.clone(),
+                from: outcome.from.clone(),
+            },
+        );
+        self.store.put_state(&state)?;
+        Ok(outcome)
     }
 
     /// How long remains of the cooldown after the last automatic switch.
