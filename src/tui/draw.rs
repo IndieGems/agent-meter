@@ -1134,8 +1134,13 @@ mod tests {
             screen.contains("68%") && screen.contains("76%") && screen.contains("19%"),
             "{screen}"
         );
-        // Resets are on the same line as the figure they belong to.
-        assert!(screen.contains("resets in 3h"), "{screen}");
+        // Resets are on the same line as the figure they belong to. Not the
+        // exact countdown: a second passing between building the window and
+        // drawing it turns "3h" into "2h59m".
+        for figure in ["68%", "76%", "19%"] {
+            let line = screen.lines().find(|line| line.contains(figure)).unwrap();
+            assert!(line.contains("resets in "), "{line}");
+        }
         // The account in use says so.
         assert!(
             screen.contains("IN USE"),
