@@ -17,12 +17,12 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use super::secret_store::{self, Backend};
-use super::{Provider, cli_command, config_home_from_env};
+use super::{Provider, cli_command, config_home_from_env, sanitize_text};
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::fsutil::{self, Mode};
 use crate::http;
 use crate::lock::DirLock;
-use crate::usage::{FIVE_HOURS, ONE_WEEK, Usage, Window};
+use crate::usage::{FIVE_HOURS, ONE_WEEK, ResetGrant, Resets, Usage, Window, WindowKind};
 
 pub struct Claude;
 
@@ -67,7 +67,19 @@ const LOGIN_SCOPES: &[&str] = &[
 /// Base name of the macOS Keychain item Claude Code stores its credential in.
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The usage endpoint, asked to include the limit resets the account holds
+/// (`cedar_ember`) and to leave out the spending block agent-meter never reads.
+/// These are the parameters Claude Code's own `/limit-reset` sends.
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
+/// The User-Agent sent with the usage request.
+///
+/// Anthropic describes an account's limit resets only to a client it
+/// recognises: under agent-meter's own name the block comes back with
+/// `ineligible_reason: "surface"` and no grants, and under Claude Code's it
+/// lists them — measured on one machine, 2026-09-29. The version is the one
+/// that was measured. The server can also refuse with `cli_version`, which
+/// would mean this needs raising to a newer Claude Code release.
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.284 (external, cli)";
 const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Claude Code's public OAuth client id. Not a secret; it identifies the CLI.
@@ -133,6 +145,7 @@ impl Provider for Claude {
             &[
                 ("authorization", &http::bearer(&credential.access_token)),
                 ("anthropic-beta", OAUTH_BETA),
+                ("user-agent", CLAUDE_CODE_USER_AGENT),
             ],
         )?;
         Ok(parse_usage(&response, Timestamp::now()))
@@ -501,7 +514,7 @@ fn parse_identity(account: Option<&Map<String, Value>>) -> Identity {
         user_id: get("accountUuid"),
         email: get("emailAddress"),
         workspace_id: get("organizationUuid"),
-        workspace_name: get("organizationName").as_deref().and_then(sanitize_name),
+        workspace_name: get("organizationName").as_deref().and_then(sanitize_text),
         // The plan and the size of the quota come from the provider, not from
         // this file; see `capture`.
         plan: None,
@@ -533,33 +546,11 @@ fn parse_profile(response: &Value) -> Identity {
         workspace_name: organization
             .and_then(|o| o.get("name"))
             .and_then(Value::as_str)
-            .and_then(sanitize_name),
+            .and_then(sanitize_text),
         plan: parse_plan(account, organization),
         capacity: multiplier(organization.and_then(|o| o.get("rate_limit_tier"))),
         email,
     }
-}
-
-/// An organisation name as it is safe to keep.
-///
-/// A team's name is written by whoever named the organisation, so it is
-/// stripped of anything that could repaint the line it lands on or make it
-/// read as another organisation. What is left is the provider's own name,
-/// which is what another tool reading an export expects; shortening it for a
-/// column is `Identity::workspace_label`'s job.
-fn sanitize_name(raw: &str) -> Option<String> {
-    let name: String = raw
-        .chars()
-        .filter(|c| !c.is_control() && !is_bidi_override(*c))
-        .collect();
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-/// Characters that reorder the text around them, so a name cannot be made to
-/// read as another organisation's.
-fn is_bidi_override(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}')
 }
 
 /// Which plan an account is on.
@@ -661,7 +652,71 @@ fn parse_usage(response: &Value, observed_at: Timestamp) -> Usage {
         observed_at,
         windows,
         limit_reached: false,
+        resets: parse_resets(response.get("cedar_ember")),
     }
+}
+
+/// Reads the `cedar_ember` block: the limit resets the account holds.
+///
+/// `eligible: false` means two different things, and only the reason tells
+/// them apart. Either the account itself holds nothing — its plan or seat does
+/// not qualify, or nothing was granted — which is a definite none; or the
+/// server would not say to this client, which is an unknown and must not be
+/// shown as none.
+fn parse_resets(block: Option<&Value>) -> Option<Resets> {
+    let block = block.filter(|b| b.is_object())?;
+    if block.get("eligible").and_then(Value::as_bool) != Some(true) {
+        return match block.get("ineligible_reason").and_then(Value::as_str) {
+            Some("tier" | "seat" | "tenure" | "no_grant") => Some(Resets::none()),
+            _ => None,
+        };
+    }
+    let grants = block
+        .get("grants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_grant)
+        .collect();
+    Some(Resets::from_grants(grants))
+}
+
+/// One grant, or `None` for one with nothing left to spend right now.
+fn parse_grant(grant: &Value) -> Option<ResetGrant> {
+    // A paused grant cannot be spent until it is resumed, so it is not a
+    // reset the account can reach for.
+    if grant.get("paused").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let left = grant
+        .get("resets_left")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)?;
+    let mut refills = Vec::new();
+    for window in grant
+        .get("clears")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        // Only the windows agent-meter shows are named; the rest, such as the
+        // overage allowance, have nothing on screen to point at.
+        let kind = match window.as_str() {
+            Some("five_hour") => WindowKind::FiveHour,
+            Some("seven_day") => WindowKind::Weekly,
+            _ => continue,
+        };
+        if !refills.contains(&kind) {
+            refills.push(kind);
+        }
+    }
+    Some(ResetGrant {
+        title: grant.get("label").and_then(Value::as_str).and_then(sanitize_text),
+        left,
+        expires_at: grant.get("ends_at").and_then(parse_rfc3339),
+        refills,
+    })
 }
 
 fn group_seconds(group: &str) -> Option<u64> {
@@ -911,6 +966,89 @@ mod tests {
         assert!(usage.windows[0].resets_at.is_some());
     }
 
+    /// The `cedar_ember` block as Claude Code's own client is sent it —
+    /// measured on one machine, 2026-09-29 — with a spent and a paused grant
+    /// added beside the live one.
+    #[test]
+    fn reads_the_limit_resets_an_account_holds() {
+        let response = json!({
+            "limits": [],
+            "cedar_ember": {
+                "eligible": true, "ineligible_reason": null, "at_limit": false, "exhausted": [],
+                "grants": [
+                    {"id": "opus55-launch-promax-20260921",
+                     "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+                     "resets_total": 1, "resets_left": 1,
+                     "starts_at": "2026-09-22T16:00:00+00:00", "ends_at": "2026-10-22T16:00:00+00:00",
+                     "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+                     "paused": false, "usable_now": true, "use_requires_limit": false,
+                     "percent_used": {"five_hour": 0, "seven_day": 92}, "blocking": [], "arm": null},
+                    {"id": "spent", "label": "Spent", "resets_total": 1, "resets_left": 0,
+                     "ends_at": "2026-10-22T16:00:00+00:00", "clears": ["five_hour"], "paused": false},
+                    {"id": "paused", "label": "Paused", "resets_total": 1, "resets_left": 1,
+                     "ends_at": "2026-10-22T16:00:00+00:00", "clears": ["five_hour"], "paused": true}
+                ],
+                "next_grant_id": "opus55-launch-promax-20260921",
+                "weekly_resets_at": "2026-09-30T14:00:00+00:00", "cooldown_until": null
+            }
+        });
+        let resets = parse_usage(&response, Timestamp::from_second(1).unwrap())
+            .resets
+            .unwrap();
+        assert_eq!(resets.available, 1);
+        let grants = resets.grants.unwrap();
+        assert_eq!(
+            grants.len(),
+            1,
+            "spent and paused grants are not the account's to spend"
+        );
+        assert_eq!(
+            grants[0].title.as_deref(),
+            Some("Claude Opus 5.5 launch: one usage-limit reset for Pro and Max")
+        );
+        assert_eq!(grants[0].left, 1);
+        assert_eq!(grants[0].expires_at.unwrap().to_string(), "2026-10-22T16:00:00Z");
+        // The overage allowance has nothing on screen to point at.
+        assert_eq!(grants[0].refills, [WindowKind::FiveHour, WindowKind::Weekly]);
+    }
+
+    /// The server refuses to say to a client it does not recognise, and that
+    /// refusal is an unknown — not an account with no resets.
+    #[test]
+    fn a_refusal_to_say_is_not_an_answer_of_none() {
+        let resets = |reason: &str| {
+            parse_resets(Some(&json!({
+                "eligible": false, "ineligible_reason": reason, "grants": [], "next_grant_id": null
+            })))
+        };
+        for reason in [
+            "surface",
+            "cli_version",
+            "unavailable",
+            "config_off",
+            "something_new",
+        ] {
+            assert_eq!(resets(reason), None, "{reason}");
+        }
+        for reason in ["no_grant", "tier", "seat", "tenure"] {
+            assert_eq!(resets(reason), Some(Resets::none()), "{reason}");
+        }
+        assert_eq!(parse_resets(None), None);
+        assert_eq!(parse_resets(Some(&Value::Null)), None);
+    }
+
+    /// A provider-written label reaches a terminal row, so it arrives clean.
+    #[test]
+    fn a_grant_label_cannot_repaint_the_line() {
+        let grant = parse_grant(&json!({
+            "label": "\u{1b}[31mFree\u{202e} reset", "resets_left": 2, "clears": ["seven_day", "seven_day"]
+        }))
+        .unwrap();
+        assert_eq!(grant.title.as_deref(), Some("[31mFree reset"));
+        assert_eq!(grant.refills, [WindowKind::Weekly]);
+        assert_eq!(grant.expires_at, None);
+    }
+
     #[test]
     fn falls_back_to_the_named_windows() {
         let response = json!({
@@ -964,24 +1102,6 @@ mod tests {
             "organization": {"organization_type": "\u{1b}[31mclaude_evil"}
         }));
         assert_eq!(identity.plan, None);
-    }
-
-    /// A team names itself, so the name is kept only once it can no longer
-    /// repaint the line it lands on or read as another organisation.
-    #[test]
-    fn an_organization_name_is_kept_as_the_provider_wrote_it_once_it_is_safe() {
-        assert_eq!(sanitize_name("Example Inc").as_deref(), Some("Example Inc"));
-        assert_eq!(
-            sanitize_name("dev@example.com's Organization").as_deref(),
-            Some("dev@example.com's Organization")
-        );
-        assert_eq!(
-            sanitize_name("\u{1b}[31mEvil\u{202e}").as_deref(),
-            Some("[31mEvil")
-        );
-        // Long names are kept whole here; the column decides how much fits.
-        assert_eq!(sanitize_name(&"n".repeat(100)).unwrap().len(), 100);
-        assert_eq!(sanitize_name("   "), None);
     }
 
     #[test]

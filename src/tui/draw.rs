@@ -24,7 +24,7 @@ use super::login::{self, Login};
 use crate::account::ProviderKind;
 use crate::engine::Status;
 use crate::timefmt;
-use crate::usage::Window;
+use crate::usage::{Usage, Window, WindowKind};
 
 /// Usage at which a window stops looking comfortable.
 const WARN_PERCENT: f64 = 75.0;
@@ -334,6 +334,7 @@ fn body(status: &Status, now: Timestamp, width: usize) -> Vec<Line<'static>> {
                 .iter()
                 .map(|window| window_line(window, now, meter_width(width)))
                 .collect();
+            lines.extend(resets_line(usage, now, width));
             if let Some(error) = error {
                 lines.push(note("! not refreshed", error, Color::Yellow, width));
             }
@@ -355,7 +356,9 @@ pub(super) fn body_height(status: &Status) -> usize {
     match (&status.account.needs_login, &status.error, &status.usage) {
         (Some(_), _, _) => 1,
         (None, Some(_), None) => 1,
-        (None, error, Some(usage)) => usage.windows.len() + usize::from(error.is_some()),
+        (None, error, Some(usage)) => {
+            usage.windows.len() + usize::from(holds_resets(usage)) + usize::from(error.is_some())
+        }
         (None, None, None) => 1,
     }
 }
@@ -445,6 +448,95 @@ fn window_line(window: &Window, now: Timestamp, bar: usize) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// Whether a reading says the account holds limit resets, and so whether
+/// `resets_line` draws a line for it.
+///
+/// Decided by the reading alone, not the clock, so a block's height can be
+/// counted without one.
+fn holds_resets(usage: &Usage) -> bool {
+    usage.resets.as_ref().is_some_and(|r| r.available > 0)
+}
+
+/// The limit resets an account holds: how many, when the first lapses, what
+/// spending one refills, and the provider's name for the grant.
+///
+/// Drawn only while there are some. A reset is a thing to reach for, and a
+/// line saying there is none would sit under every account that has never
+/// been granted one.
+fn resets_line(usage: &Usage, now: Timestamp, width: usize) -> Option<Line<'static>> {
+    let resets = usage.resets.as_ref().filter(|_| holds_resets(usage))?;
+    let mut spans = vec![
+        Span::raw("    "),
+        Span::styled(format!("{:<14}", "limit resets"), Style::new().fg(Color::Gray)),
+    ];
+    let left = resets.left_at(now);
+    if left == 0 {
+        // Lapsed since the reading was taken; the next one drops it.
+        spans.push(Span::styled("lapsed unused", Style::new().fg(DIM)));
+        return Some(Line::from(spans));
+    }
+    spans.push(Span::styled(
+        format!("{left} available"),
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+    ));
+
+    let grants = resets.live_grants_at(now);
+    if let Some(at) = resets.next_expiry_at(now) {
+        let lapses = if grants.iter().any(|g| g.expires_at != Some(at)) {
+            "first expires"
+        } else {
+            "expires"
+        };
+        // Unspent, a reset is simply lost at its deadline; a close one is
+        // worth the colour.
+        let soon = at.as_second() - now.as_second() <= EXPIRY_WARNING_SECS;
+        spans.push(Span::styled(
+            format!("   {lapses} in {} ({})", timefmt::until(now, at), day_of(at)),
+            Style::new().fg(if soon { Color::Yellow } else { DIM }),
+        ));
+    }
+    if let Some(first) = grants.first() {
+        let refills: Vec<&str> = first
+            .refills
+            .iter()
+            .filter_map(|kind| match kind {
+                WindowKind::FiveHour => Some("5h"),
+                WindowKind::Weekly => Some("weekly"),
+                WindowKind::Other => None,
+            })
+            .collect();
+        // What is left gives way to a narrow window, the least useful first:
+        // the provider's title, then what a reset refills. The count and the
+        // deadline always stay. The gutter drawn before the line takes one
+        // column, and one more is left clear at the edge.
+        let room = |spans: &[Span]| width.saturating_sub(spans_width(spans) + 2);
+        let refills = format!("   refills {}", refills.join(" + "));
+        if refills.len() > "   refills ".len() && refills.chars().count() <= room(&spans) {
+            spans.push(Span::styled(refills, Style::new().fg(DIM)));
+        }
+        let room = room(&spans).saturating_sub(3);
+        if let Some(title) = &first.title
+            && room >= 12
+        {
+            spans.push(Span::styled(
+                format!("   {}", truncate(title, room)),
+                Style::new().fg(DIM),
+            ));
+        }
+    }
+    Some(Line::from(spans))
+}
+
+/// A reset this close to lapsing is drawn as a warning.
+const EXPIRY_WARNING_SECS: i64 = 2 * 24 * 60 * 60;
+
+/// The local calendar day of `at`, such as `Oct 22`.
+fn day_of(at: Timestamp) -> String {
+    at.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%b %-d")
+        .to_string()
 }
 
 /// How far ahead of the clock this window has been spent, when far enough to
@@ -965,7 +1057,7 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::{FIVE_HOURS, ONE_WEEK, Usage};
+    use crate::usage::{FIVE_HOURS, ONE_WEEK, ResetGrant, Resets, Usage};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -990,6 +1082,7 @@ mod tests {
             observed_at: Timestamp::now(),
             windows,
             limit_reached: false,
+            resets: None,
         }
     }
 
@@ -1017,7 +1110,81 @@ mod tests {
         // An error and no reading at all.
         statuses[3].error = Some(long.into());
         // Never read.
+        //
+        // Holding a reset, and one whose only reset lapsed since the reading.
+        let mut held = limits();
+        held.resets = Some(reset(Some(20 * 86_400)));
+        let mut lapsed = limits();
+        lapsed.resets = Some(reset(Some(-60)));
+        let mut extra = crate::tui::app::sample_statuses(2);
+        extra[0].account.id = "claude-held".into();
+        extra[0].usage = Some(held);
+        extra[1].account.id = "claude-lapsed".into();
+        extra[1].usage = Some(lapsed);
+        extra[1].error = Some(long.into());
+        statuses.extend(extra);
         statuses
+    }
+
+    fn reset(expires_in: Option<i64>) -> Resets {
+        Resets::from_grants(vec![ResetGrant {
+            title: Some("Claude Opus 5.5 launch: one usage-limit reset for Pro and Max".into()),
+            left: 1,
+            expires_at: expires_in.map(|secs| Timestamp::now() + jiff::SignedDuration::from_secs(secs)),
+            refills: vec![WindowKind::FiveHour, WindowKind::Weekly],
+        }])
+    }
+
+    /// A reset is a thing to reach for, so an account holding one says how
+    /// many, when it lapses and what it refills — and an account holding none
+    /// says nothing about resets at all.
+    #[test]
+    fn a_held_reset_is_shown_with_its_deadline_and_what_it_refills() {
+        let text = |usage: Usage, width: usize| {
+            let mut status = crate::tui::app::sample_statuses(1).remove(0);
+            status.usage = Some(usage);
+            body(&status, Timestamp::now(), width)
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let with = |resets: Option<Resets>| {
+            let mut u = usage(vec![window(FIVE_HOURS, None, 0.0, 3600)]);
+            u.resets = resets;
+            u
+        };
+
+        let lines = text(with(Some(reset(Some(20 * 86_400 + 600)))), 140);
+        let line = lines.last().unwrap();
+        assert!(line.contains("limit resets  1 available"), "{line}");
+        assert!(line.contains("expires in 20d"), "{line}");
+        assert!(line.contains("refills 5h + weekly"), "{line}");
+        assert!(line.contains("Claude Opus 5.5 launch"), "{line}");
+
+        // A narrow window drops the title, then what a reset refills, and
+        // keeps the count and the deadline.
+        let medium = text(with(Some(reset(Some(20 * 86_400)))), 90);
+        let line = medium.last().unwrap();
+        assert!(line.chars().count() < 90, "{line}");
+        assert!(line.contains("refills 5h + weekly"), "{line}");
+        assert!(!line.contains("Claude"), "{line}");
+        let narrow = text(with(Some(reset(Some(20 * 86_400)))), 70);
+        let line = narrow.last().unwrap();
+        assert!(line.chars().count() < 70, "{line}");
+        assert!(line.contains("1 available   expires in "), "{line}");
+        assert!(!line.contains("refills"), "{line}");
+
+        assert!(
+            text(with(Some(reset(Some(-60)))), 140)
+                .last()
+                .unwrap()
+                .contains("lapsed unused")
+        );
+        for nothing in [None, Some(Resets::none())] {
+            let lines = text(with(nothing), 140);
+            assert_eq!(lines.len(), 1);
+            assert!(!lines[0].contains("limit resets"));
+        }
     }
 
     /// Scrolling needs a block's height before the block exists, so the height

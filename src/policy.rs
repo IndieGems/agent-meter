@@ -512,6 +512,7 @@ mod tests {
                 resets_at: Timestamp::from_second(NOW + 3600).ok(),
             }],
             limit_reached: false,
+            resets: None,
         }
     }
 
@@ -553,6 +554,7 @@ mod tests {
                 },
             ],
             limit_reached: false,
+            resets: None,
         }
     }
 
@@ -576,6 +578,7 @@ mod tests {
                 },
             ],
             limit_reached: false,
+            resets: None,
         }
     }
 

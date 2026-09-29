@@ -273,6 +273,32 @@ mod tests {
         );
     }
 
+    /// A provider that answers only its own client is sent that client's
+    /// name in place of ours, rather than alongside it.
+    #[test]
+    fn a_request_can_name_its_own_user_agent() {
+        let mut server = mockito::Server::new();
+        let named = server
+            .mock("GET", "/named")
+            .match_header("user-agent", "claude-cli/1.0 (external, cli)")
+            .with_body("{}")
+            .expect(1)
+            .create();
+        let ours = server
+            .mock("GET", "/ours")
+            .match_header("user-agent", user_agent().as_str())
+            .with_body("{}")
+            .expect(1)
+            .create();
+
+        let url = format!("{}/named", server.url());
+        get_json_unless::<Value>(false, &url, &[("user-agent", "claude-cli/1.0 (external, cli)")]).unwrap();
+        let url = format!("{}/ours", server.url());
+        get_json_unless::<Value>(false, &url, &[]).unwrap();
+        named.assert();
+        ours.assert();
+    }
+
     #[test]
     fn classifies_live_statuses() {
         let mut server = mockito::Server::new();

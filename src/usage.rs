@@ -15,7 +15,8 @@ const WINDOW_TOLERANCE: u64 = 300;
 /// difference is how long the window is, so the shorter one comes back sooner.
 /// That is what the difference is good for: not a rate against a budget, but
 /// how soon an account pressed against this limit can work again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WindowKind {
     FiveHour,
     Weekly,
@@ -88,6 +89,96 @@ pub struct Usage {
     /// The provider says requests are currently being refused.
     #[serde(default)]
     pub limit_reached: bool,
+    /// The limit resets the account holds, or `None` where the provider did
+    /// not say. Not saying is not the same as holding none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets: Option<Resets>,
+}
+
+/// Limit resets: grants a provider hands out now and then which, when spent,
+/// refill an account's windows before they would turn over on their own.
+///
+/// Anthropic calls one a "limit reset" and OpenAI a "rate limit reset credit";
+/// they are the same thing, and both lapse if they are not used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Resets {
+    /// How many the provider says the account can spend.
+    pub available: u32,
+    /// What each one is, or `None` where the provider counted them without
+    /// describing them. Only grants that still have a reset to spend are kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<ResetGrant>>,
+}
+
+/// One grant of limit resets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResetGrant {
+    /// The provider's name for it, cleaned of anything that could repaint the
+    /// line it is drawn on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Resets left to spend in this grant.
+    pub left: u32,
+    /// When the grant lapses, used or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
+    /// The account's windows spending one refills; empty where the provider
+    /// does not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refills: Vec<WindowKind>,
+}
+
+impl ResetGrant {
+    fn is_live_at(&self, now: Timestamp) -> bool {
+        self.left > 0 && self.expires_at.is_none_or(|at| at > now)
+    }
+}
+
+impl Resets {
+    /// None held, as a definite answer rather than an unknown one.
+    pub fn none() -> Self {
+        Self {
+            available: 0,
+            grants: Some(Vec::new()),
+        }
+    }
+
+    /// Builds the count from the grants themselves.
+    pub fn from_grants(grants: Vec<ResetGrant>) -> Self {
+        Self {
+            available: grants.iter().map(|g| g.left).sum(),
+            grants: Some(grants),
+        }
+    }
+
+    /// Resets that can still be spent as of `now`.
+    ///
+    /// A reading can be hours old, and a grant that lapsed since it was taken
+    /// is gone even though the reading still lists it.
+    pub fn left_at(&self, now: Timestamp) -> u32 {
+        match &self.grants {
+            Some(grants) => grants.iter().filter(|g| g.is_live_at(now)).map(|g| g.left).sum(),
+            None => self.available,
+        }
+    }
+
+    /// The grants still worth showing as of `now`, soonest to lapse first.
+    pub fn live_grants_at(&self, now: Timestamp) -> Vec<&ResetGrant> {
+        let mut live: Vec<_> = self
+            .grants
+            .iter()
+            .flatten()
+            .filter(|g| g.is_live_at(now))
+            .collect();
+        // A grant with no end date sorts last: it is the one that can wait.
+        live.sort_by_key(|g| (g.expires_at.is_none(), g.expires_at));
+        live
+    }
+
+    /// When the first of the resets still held lapses.
+    pub fn next_expiry_at(&self, now: Timestamp) -> Option<Timestamp> {
+        self.live_grants_at(now).iter().find_map(|g| g.expires_at)
+    }
 }
 
 impl Usage {
@@ -223,6 +314,7 @@ mod tests {
             observed_at: ts(0),
             windows: vec![window(FIVE_HOURS, 40.0, 1000), window(ONE_WEEK, 70.0, 5000)],
             limit_reached: false,
+            resets: None,
         };
         assert_eq!(u.binding_window(ts(10)).unwrap().window_secs, ONE_WEEK);
         assert_eq!(u.headroom_at(ts(10)), 30.0);
@@ -235,11 +327,79 @@ mod tests {
             observed_at: ts(0),
             windows: vec![window(FIVE_HOURS, 100.0, 1000)],
             limit_reached: true,
+            resets: None,
         };
         assert!(u.is_exhausted_at(ts(999)));
         assert_eq!(u.next_relief(ts(999)), Some(ts(1000)));
         assert!(!u.is_exhausted_at(ts(1000)));
         assert_eq!(u.used_at(ts(1000)), 0.0);
+    }
+
+    fn grant(left: u32, expires: Option<i64>) -> ResetGrant {
+        ResetGrant {
+            title: None,
+            left,
+            expires_at: expires.map(ts),
+            refills: Vec::new(),
+        }
+    }
+
+    /// A reading can be hours old; a reset that lapsed since is not one the
+    /// account can still spend, even though the reading lists it.
+    #[test]
+    fn a_reset_past_its_deadline_is_no_longer_held() {
+        let resets = Resets::from_grants(vec![grant(1, Some(2000)), grant(2, Some(1000))]);
+        assert_eq!(resets.available, 3);
+        assert_eq!(resets.left_at(ts(500)), 3);
+        assert_eq!(resets.next_expiry_at(ts(500)), Some(ts(1000)));
+        assert_eq!(resets.left_at(ts(1000)), 1);
+        assert_eq!(resets.next_expiry_at(ts(1000)), Some(ts(2000)));
+        assert_eq!(resets.left_at(ts(2000)), 0);
+        assert_eq!(resets.next_expiry_at(ts(2000)), None);
+    }
+
+    #[test]
+    fn grants_are_listed_soonest_to_lapse_first_and_open_ended_ones_last() {
+        let resets = Resets::from_grants(vec![grant(1, None), grant(1, Some(900)), grant(1, Some(100))]);
+        let order: Vec<_> = resets
+            .live_grants_at(ts(0))
+            .iter()
+            .map(|g| g.expires_at)
+            .collect();
+        assert_eq!(order, [Some(ts(100)), Some(ts(900)), None]);
+    }
+
+    /// Codex counts its credits before it describes them; the count stands on
+    /// its own until then.
+    #[test]
+    fn a_count_without_a_description_is_still_a_count() {
+        let resets = Resets {
+            available: 2,
+            grants: None,
+        };
+        assert_eq!(resets.left_at(ts(0)), 2);
+        assert_eq!(resets.next_expiry_at(ts(0)), None);
+        assert!(resets.live_grants_at(ts(0)).is_empty());
+    }
+
+    /// Readings cached before resets were read have no field for them, and
+    /// must load as "not said", never as "none held".
+    #[test]
+    fn a_reading_cached_before_resets_were_read_says_nothing_about_them() {
+        let old: Usage =
+            serde_json::from_str(r#"{"observed_at":"2026-09-01T00:00:00Z","windows":[]}"#).unwrap();
+        assert_eq!(old.resets, None);
+
+        let mut usage = old.clone();
+        usage.resets = Some(Resets::from_grants(vec![ResetGrant {
+            title: Some("Full reset".into()),
+            left: 1,
+            expires_at: Some(ts(5000)),
+            refills: vec![WindowKind::FiveHour, WindowKind::Weekly],
+        }]));
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains(r#""refills":["five_hour","weekly"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<Usage>(&json).unwrap(), usage);
     }
 
     #[test]

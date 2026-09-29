@@ -576,6 +576,16 @@ fn status_json(status: &Status, now: Timestamp, poll_interval: u64) -> serde_jso
                 "usedPercent": w.used_at(now),
                 "resetsAt": w.resets_at,
             })).collect::<Vec<_>>(),
+            "limitResets": usage.resets.as_ref().map(|resets| json!({
+                "available": resets.left_at(now),
+                "nextExpiresAt": resets.next_expiry_at(now),
+                "grants": resets.grants.as_ref().map(|_| resets.live_grants_at(now).iter().map(|g| json!({
+                    "title": g.title,
+                    "left": g.left,
+                    "expiresAt": g.expires_at,
+                    "refills": g.refills,
+                })).collect::<Vec<_>>()),
+            })),
         })),
         "error": status.error,
         "errorAt": status.error_at,
@@ -597,6 +607,7 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
             "USED",
             "WINDOWS",
             "RESETS IN",
+            "LIMIT RESETS",
             "",
         ]);
 
@@ -671,6 +682,7 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
             ),
             Cell::new(windows),
             Cell::new(resets),
+            limit_resets_cell(status.usage.as_ref(), now),
             Cell::new(flag).fg(if account.needs_login.is_some() {
                 Color::Red
             } else {
@@ -684,6 +696,33 @@ fn render_table(engine: &Engine, statuses: &[Status], now: Timestamp) -> String 
         rendered.push_str(&format!("  ! {note}\n"));
     }
     rendered
+}
+
+/// The limit resets an account holds: how many, and how soon the first of
+/// them lapses, since a reset left unspent past then is simply lost.
+///
+/// `?` where the provider did not say, which is not the same as `-`, holding
+/// none.
+fn limit_resets_cell(usage: Option<&crate::usage::Usage>, now: Timestamp) -> Cell {
+    let Some(resets) = usage.and_then(|u| u.resets.as_ref()) else {
+        return Cell::new("?");
+    };
+    let left = resets.left_at(now);
+    if left == 0 {
+        return Cell::new("-");
+    }
+    let text = match resets.next_expiry_at(now) {
+        Some(at) => {
+            let others_later = resets
+                .live_grants_at(now)
+                .iter()
+                .any(|g| g.expires_at != Some(at));
+            let lapses = if others_later { "first expires" } else { "expires" };
+            format!("{left}, {lapses} in {}", crate::timefmt::until(now, at))
+        }
+        None => left.to_string(),
+    };
+    Cell::new(text).fg(Color::Green)
 }
 
 fn used_cell(used: Option<f64>, exhausted: bool) -> Cell {

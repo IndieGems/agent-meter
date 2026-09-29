@@ -9,11 +9,11 @@ account as a limit approaches.
 
 ```console
 $ agent-meter list
-     ID         PROVIDER      ACCOUNT              ORGANIZATION  PLAN     USED  WINDOWS                        RESETS IN
- ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- *   claude-1   Claude Code   dev@example.com      Example Inc   team 5x  94%   5h 94%  weekly 61%  weekly Opus 4%  2h13m
-     claude-2   Claude Code   dev@example.com      -             max 20x  12%   5h 12%  weekly 30%                  3h02m
- *   codex-1    Codex         dev@example.com      -             pro      8%    5h 0%  weekly 8%                    6d2h
+     ID         PROVIDER      ACCOUNT              ORGANIZATION  PLAN     USED  WINDOWS                        RESETS IN  LIMIT RESETS
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ *   claude-1   Claude Code   dev@example.com      Example Inc   team 5x  94%   5h 94%  weekly 61%  weekly Opus 4%  2h13m      -
+     claude-2   Claude Code   dev@example.com      -             max 20x  12%   5h 12%  weekly 30%                  3h02m      1, expires in 22d
+ *   codex-1    Codex         dev@example.com      -             pro      8%    5h 0%  weekly 8%                    6d2h       1, expires in 23d
 
 $ agent-meter watch
 Watching every 1m at a 90% threshold. Press Ctrl-C to stop.
@@ -211,6 +211,16 @@ the one that would be taken next says so too, and the rest follow in the order
 they would actually be chosen — so the order on screen is the order that will
 happen, not an arrangement of its own.
 
+An account holding limit resets gets one more line under its limits: how many,
+when the first lapses (in yellow once it is two days away), what spending one
+refills, and the provider's name for the grant.
+
+```text
+  2  oncall@example.com  personal · max 20x
+     weekly        ━━━━━━━━━━━━━━━━━━━━━━━━━━╸━   92%   resets in 21h2m
+     limit resets  1 available   expires in 22d21h (Oct 22)   refills 5h + weekly   Claude Opus 5.5 launch: …
+```
+
 `▲ ahead of pace` marks a weekly allowance being spent faster than the clock
 that refills it: 60% of a week is unremarkable on day five and a warning on day
 two. It is only ever said of a weekly window, because a five-hour one is a rate
@@ -244,6 +254,12 @@ Each account includes `id`, `provider`, `active`, `needsLogin`,
 `usedPercent`, `resetsAt`, and a human-readable `label`. Use `kind` and `scope`
 for ingestion rather than parsing the display label. A scoped model limit is
 not an account-wide limit.
+
+Usage also carries `limitResets`: `available`, `nextExpiresAt`, and `grants`,
+each with a `title`, `left`, `expiresAt` and the window kinds it `refills`.
+`limitResets` is `null` where the provider did not say, which is not the same as
+holding none (`available: 0`). `grants` is `null` where the provider counted
+its resets without describing them. Resets past their deadline are left out.
 
 A successful command can contain failed account polls: inspect `error`,
 `needsLogin` and `usage.observedAt`. Missing or old usage is unknown, not zero
@@ -415,6 +431,25 @@ and writes exactly the files the CLIs already use:
 
 Usage comes from the vendors' own endpoints, the ones behind `/usage` in Claude
 Code and `/status` in Codex.
+
+### Limit resets
+
+Both vendors now and then hand out a free **limit reset**: spent, it refills an
+account's windows at once, and unspent it lapses on a date. `agent-meter` shows
+the ones each account holds, and when they expire, next to its usage. It never
+spends one.
+
+- **Claude Code** — the usage reading asks for the same `cedar_ember` block
+  Claude Code's `/limit-reset` reads. Anthropic describes it only to Claude
+  Code, so that one request identifies itself as Claude Code; to any other
+  client the answer is "not for this surface", which `agent-meter` shows as
+  unknown (`?`) rather than as none.
+- **Codex** — the usage reading counts the account's reset credits, and
+  `/wham/rate-limit-reset-credits` describes them. That second request is made
+  only when the count changes, not at every poll.
+
+Anthropic's own instructions say to spend a reset from Settings → Usage on the
+web or in Claude Desktop.
 
 Refresh tokens are single-use. If a CLI refreshes its own token, `agent-meter`
 notices and adopts the new one rather than keeping a spent copy — otherwise the

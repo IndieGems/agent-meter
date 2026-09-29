@@ -721,19 +721,25 @@ impl Engine {
             let accounts = self.store.accounts()?;
             let cache = self.store.usage_cache()?;
             let now = Timestamp::now();
-            let due: Vec<Account> = accounts
+            let due: Vec<(Account, Option<Usage>)> = accounts
                 .into_iter()
                 .filter(|a| ids.is_empty() || ids.contains(&a.id))
                 .filter(|a| force || self.is_poll_due(&cache, a, now))
+                .map(|a| {
+                    let previous = cache.get(&a.id).and_then(|e| e.usage.clone());
+                    (a, previous)
+                })
                 .collect();
             (due, active_ids)
         };
 
         let polled: Vec<_> = due
             .iter()
-            .map(|account| {
+            .map(|(account, previous)| {
                 let active = active_ids.contains(&account.id);
-                let outcome = self.poll_one(account, active);
+                let outcome = self.poll_one(account, active).map(|(credential, usage)| {
+                    self.describe_resets(account, &credential, usage, previous.as_ref())
+                });
                 if outcome.is_ok() {
                     self.learn_entitlement(account, active);
                 }
@@ -844,15 +850,17 @@ impl Engine {
     }
 
     /// Reads one account's usage, refreshing its token first if needed and
-    /// retrying once if the provider rejects it.
-    fn poll_one(&self, account: &Account, active: bool) -> Result<Usage, http::Error> {
+    /// retrying once if the provider rejects it. Returns the credential the
+    /// reading was taken with alongside it.
+    fn poll_one(&self, account: &Account, active: bool) -> Result<(Credential, Usage), http::Error> {
         let provider = provider::get(account.provider);
         let fleet = crate::fleet::Fleet::load(&self.store).map_err(http::Error::Transport)?;
         if let Some(home) = fleet.homes.get(&account.id) {
             let credential = self.capture_fleet_credential(account, home)?;
             // A registered native CLI is the sole refresh writer. An expired
             // credential produces a polling error until that CLI refreshes it.
-            return provider.fetch_usage(&credential);
+            let usage = provider.fetch_usage(&credential)?;
+            return Ok((credential, usage));
         }
         let mut credential = account.credential.clone();
 
@@ -861,6 +869,7 @@ impl Engine {
         }
 
         match provider.fetch_usage(&credential) {
+            Ok(usage) => Ok((credential, usage)),
             // The token was rejected even though it looked current; one
             // refresh is worth trying before declaring the account dead. Not
             // for the account in use: the CLI was sent the same refusal, and
@@ -868,10 +877,44 @@ impl Engine {
             // at the next poll.
             Err(http::Error::Unauthorized { .. }) if !active => {
                 let credential = self.refresh_and_store(provider, account, active)?;
-                provider.fetch_usage(&credential)
+                let usage = provider.fetch_usage(&credential)?;
+                Ok((credential, usage))
             }
-            other => other,
+            Err(error) => Err(error),
         }
+    }
+
+    /// Fills in the limit resets a reading counted without describing.
+    ///
+    /// Codex counts an account's reset credits in every usage reading but
+    /// says what they are, and when they lapse, only at a second endpoint.
+    /// Asking it at every poll would double the requests of a provider polled
+    /// every minute, for an answer that changes only when a credit is granted
+    /// or spent — so it is asked when the count changes, and the previous
+    /// description is carried forward while the count holds.
+    ///
+    /// A failure leaves the count standing without a description, and the
+    /// next poll asks again: a count is worth showing on its own.
+    fn describe_resets(
+        &self,
+        account: &Account,
+        credential: &Credential,
+        mut usage: Usage,
+        previous: Option<&Usage>,
+    ) -> Usage {
+        let Some(resets) = usage.resets.as_mut().filter(|r| r.grants.is_none()) else {
+            return usage;
+        };
+        let described = previous
+            .and_then(|p| p.resets.as_ref())
+            .filter(|p| p.available == resets.available)
+            .and_then(|p| p.grants.clone());
+        resets.grants = described.or_else(|| {
+            provider::get(account.provider)
+                .fetch_reset_grants(credential)
+                .ok()
+        });
+        usage
     }
 
     fn capture_fleet_credential(
@@ -1222,6 +1265,47 @@ mod tests {
         (dir, Engine::with_store(store).unwrap())
     }
 
+    /// Codex counts its reset credits in every reading and describes them
+    /// only at a second endpoint. Asking it every minute for an answer that
+    /// has not changed would double the requests, so while the count holds
+    /// the description already taken is carried forward — with no request.
+    #[test]
+    fn a_reset_description_is_carried_forward_while_the_count_holds() {
+        use crate::usage::{ResetGrant, Resets};
+        let (_tmp, engine) = engine();
+        engine
+            .store_captured(ProviderKind::Codex, captured("a@x.com", "r1"), None)
+            .unwrap();
+        let account = engine.store().account("codex-1").unwrap().unwrap();
+        let reading = |resets: Resets| Usage {
+            observed_at: Timestamp::now(),
+            windows: Vec::new(),
+            limit_reached: false,
+            resets: Some(resets),
+        };
+        let described = Resets::from_grants(vec![ResetGrant {
+            title: Some("Full reset".into()),
+            left: 1,
+            expires_at: Some(Timestamp::now() + SignedDuration::from_hours(24 * 20)),
+            refills: Vec::new(),
+        }]);
+        let counted = Resets {
+            available: 1,
+            grants: None,
+        };
+
+        let previous = reading(described.clone());
+        let usage = engine.describe_resets(&account, &account.credential, reading(counted), Some(&previous));
+        assert_eq!(usage.resets, Some(described.clone()));
+
+        // A reading that describes its own resets is left as it came.
+        let none = reading(Resets::none());
+        let usage = engine.describe_resets(&account, &account.credential, none.clone(), Some(&previous));
+        assert_eq!(usage, none);
+        let usage = engine.describe_resets(&account, &account.credential, previous.clone(), None);
+        assert_eq!(usage.resets, Some(described));
+    }
+
     fn captured(email: &str, refresh: &str) -> Captured {
         Captured {
             identity: Identity {
@@ -1258,6 +1342,7 @@ mod tests {
                     observed_at: Timestamp::now(),
                     windows: Vec::new(),
                     limit_reached: false,
+                    resets: None,
                 },
             );
             for _ in 0..3 {

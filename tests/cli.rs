@@ -1756,6 +1756,42 @@ fn json_usage_exposes_machine_scopes_and_rate_limited_polling() {
     assert!(rows[0]["usage"]["windows"][0]["scope"].is_null());
     assert_eq!(rows[0]["usage"]["windows"][1]["scope"], "Opus");
     assert_eq!(rows[0]["pollIntervalSeconds"], 300);
+    assert!(rows[0]["usage"]["limitResets"].is_null(), "not said is not none");
     assert!(!rows.to_string().contains("refresh_token"));
     f.cmd(&["list", "--poll", "--refresh"]).assert().failure();
+}
+
+/// An account's limit resets are listed with it: how many, when they lapse
+/// and what each is — and one that lapsed since the reading is gone from both.
+#[test]
+fn limit_resets_are_listed_with_their_deadlines() {
+    let f = Fixture::new();
+    f.sign_in_claude("user@example.com", "user", "refresh");
+    f.run(&["import", "claude"]);
+    let now = jiff::Timestamp::now();
+    let later = now + jiff::SignedDuration::from_hours(24 * 20 + 1);
+    let cache = json!({"entries": {"claude-1": {
+        "usage": {"observed_at": now.to_string(), "windows": [], "resets": {
+            "available": 2,
+            "grants": [
+                {"title": "Launch reset", "left": 1, "expires_at": later.to_string(),
+                 "refills": ["five_hour", "weekly"]},
+                {"title": "Lapsed", "left": 1,
+                 "expires_at": (now - jiff::SignedDuration::from_hours(1)).to_string()}
+            ]
+        }}, "failures": 0
+    }}});
+    write_json(&f.data.join("usage.json"), &cache);
+
+    let rows: Value = serde_json::from_str(&f.run(&["list", "--json"])).unwrap();
+    let resets = &rows[0]["usage"]["limitResets"];
+    assert_eq!(resets["available"], 1);
+    assert_eq!(resets["nextExpiresAt"], later.to_string());
+    assert_eq!(resets["grants"].as_array().unwrap().len(), 1);
+    assert_eq!(resets["grants"][0]["title"], "Launch reset");
+    assert_eq!(resets["grants"][0]["refills"], json!(["five_hour", "weekly"]));
+
+    let table = f.run(&["list"]);
+    assert!(table.contains("LIMIT RESETS"), "{table}");
+    assert!(table.contains("1, expires in 20d"), "{table}");
 }

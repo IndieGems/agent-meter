@@ -12,10 +12,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 
-use super::{Provider, cli_command, config_home_from_env};
+use super::{Provider, cli_command, config_home_from_env, sanitize_text};
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::fsutil::{self, Mode};
-use crate::usage::{Usage, Window};
+use crate::usage::{ResetGrant, Resets, Usage, Window};
 use crate::{http, jwt};
 
 pub struct Codex;
@@ -26,6 +26,9 @@ const DEFAULT_HOME: &str = ".codex";
 const AUTH_FILE: &str = "auth.json";
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Lists an account's rate limit reset credits. The usage reading only counts
+/// them; this says what each one is and when it lapses.
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex CLI's public OAuth client id.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -132,6 +135,14 @@ impl Provider for Codex {
             &[("authorization", &http::bearer(&credential.access_token))],
         )?;
         Ok(parse_usage(&response, Timestamp::now()))
+    }
+
+    fn fetch_reset_grants(&self, credential: &Credential) -> http::Result<Vec<ResetGrant>> {
+        let response: Value = http::get_json(
+            RESET_CREDITS_URL,
+            &[("authorization", &http::bearer(&credential.access_token))],
+        )?;
+        Ok(parse_reset_credits(&response))
     }
 
     fn fetch_identity(&self, credential: &Credential) -> http::Result<Identity> {
@@ -344,7 +355,57 @@ fn parse_usage(response: &Value, observed_at: Timestamp) -> Usage {
         observed_at,
         windows,
         limit_reached,
+        resets: parse_reset_count(response),
     }
+}
+
+/// Reads how many rate limit reset credits the account holds.
+///
+/// The reading counts them and no more. A count of none is complete as it
+/// stands; any other leaves the credits to be described by
+/// `/wham/rate-limit-reset-credits`.
+fn parse_reset_count(response: &Value) -> Option<Resets> {
+    let available = response
+        .pointer("/rate_limit_reset_credits/available_count")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())?;
+    Some(if available == 0 {
+        Resets::none()
+    } else {
+        Resets {
+            available,
+            grants: None,
+        }
+    })
+}
+
+/// Reads `/wham/rate-limit-reset-credits`: one grant per credit that can still
+/// be spent.
+///
+/// A credit being redeemed or already redeemed is listed alongside the
+/// available ones, and is not the account's to spend.
+fn parse_reset_credits(response: &Value) -> Vec<ResetGrant> {
+    response
+        .get("credits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|credit| credit.get("status").and_then(Value::as_str) == Some("available"))
+        .map(|credit| ResetGrant {
+            title: credit
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(sanitize_text),
+            left: 1,
+            expires_at: credit
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(|at| at.parse().ok()),
+            // "codex_rate_limits" is the only type seen, and it does not say
+            // which of the windows it clears.
+            refills: Vec::new(),
+        })
+        .collect()
 }
 
 fn collect_windows(rate_limit: &Value, scope: Option<&str>, windows: &mut Vec<Window>) {
@@ -570,6 +631,56 @@ mod tests {
         assert!(!usage.limit_reached);
 
         assert_eq!(parse_usage_identity(&response).email.unwrap(), "dev@example.com");
+    }
+
+    /// The usage reading counts reset credits and no more — measured on one
+    /// machine, 2026-09-28.
+    #[test]
+    fn the_usage_reading_counts_reset_credits_without_describing_them() {
+        let count = |value: Value| parse_usage(&value, Timestamp::from_second(1).unwrap()).resets;
+        let held = count(
+            json!({"rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 0}}),
+        );
+        assert_eq!(
+            held,
+            Some(Resets {
+                available: 1,
+                grants: None
+            })
+        );
+        // None held is complete as it stands; there is nothing to describe.
+        assert_eq!(
+            count(json!({"rate_limit_reset_credits": {"available_count": 0}})),
+            Some(Resets::none())
+        );
+        assert_eq!(count(json!({"rate_limit": {}})), None);
+    }
+
+    /// `/wham/rate-limit-reset-credits` as measured on one machine,
+    /// 2026-09-28, plus a credit already on its way to being spent.
+    #[test]
+    fn describes_the_credits_that_can_still_be_spent() {
+        let grants = parse_reset_credits(&json!({
+            "credits": [
+                {"id": "RateLimitResetCredit_1", "reset_type": "codex_rate_limits",
+                 "is_supported_by_plan": true, "status": "available",
+                 "granted_at": "2026-09-22T21:01:39.507836Z", "expires_at": "2026-10-22T21:01:39.507836Z",
+                 "redeem_started_at": null, "redeemed_at": null,
+                 "title": "Full reset",
+                 "description": "Thanks for using Codex! You've been granted one free rate limit reset."},
+                {"id": "RateLimitResetCredit_2", "status": "redeeming", "title": "Full reset",
+                 "expires_at": "2026-10-22T21:01:39Z"}
+            ],
+            "available_count": 1, "total_earned_count": 0,
+            "immediate_reset_purchase_eligible": false, "history_enabled": true
+        }));
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].title.as_deref(), Some("Full reset"));
+        assert_eq!(grants[0].left, 1);
+        assert_eq!(
+            grants[0].expires_at.unwrap().to_string(),
+            "2026-10-22T21:01:39.507836Z"
+        );
     }
 
     #[test]

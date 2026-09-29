@@ -531,6 +531,7 @@ mod tests {
                 observed_at: Timestamp::from_second(1).unwrap(),
                 windows: vec![],
                 limit_reached: false,
+                resets: None,
             },
         );
         store.put_usage_cache(&cache).unwrap();

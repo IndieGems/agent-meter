@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 
 use crate::account::{Account, Captured, Credential, Identity, ProviderKind};
 use crate::http;
-use crate::usage::Usage;
+use crate::usage::{ResetGrant, Usage};
 
 /// The rate used for a provider that has not stated its own.
 ///
@@ -54,6 +54,14 @@ pub trait Provider: Send + Sync {
 
     /// Reads the account's current usage.
     fn fetch_usage(&self, credential: &Credential) -> http::Result<Usage>;
+
+    /// Describes the limit resets a usage reading counted without describing.
+    ///
+    /// Only called when a reading holds resets it did not describe, and a
+    /// provider whose readings always describe them never is.
+    fn fetch_reset_grants(&self, _credential: &Credential) -> http::Result<Vec<ResetGrant>> {
+        Ok(Vec::new())
+    }
 
     /// Reads identity details the credential alone does not carry. Providers
     /// that need no extra call return what they can derive.
@@ -107,6 +115,28 @@ pub fn config_home_from_env(env_var: &str, default: &str) -> Result<PathBuf> {
         return Ok(path);
     }
     Ok(crate::paths::home_dir()?.join(default))
+}
+
+/// Text a provider wrote, as it is safe to keep.
+///
+/// An organisation names itself, and a provider titles its own offers, so what
+/// arrives is stripped of anything that could repaint the line it lands on or
+/// make it read as something else. What is left is the provider's own words,
+/// which is what another tool reading an export expects; shortening them to
+/// fit is the display's job.
+pub(crate) fn sanitize_text(raw: &str) -> Option<String> {
+    let text: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_override(*c))
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Characters that reorder the text around them, so a name cannot be made to
+/// read as another organisation's.
+fn is_bidi_override(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}')
 }
 
 /// Environment variables that force an agent CLI to use a fixed key or token.
@@ -225,6 +255,24 @@ mod tests {
             assert!(args.iter().any(|a| a == "login"), "{kind}: {args:?}");
             assert!(home.exists(), "{kind} must prepare the login directory");
         }
+    }
+
+    /// A team names itself, so the name is kept only once it can no longer
+    /// repaint the line it lands on or read as another organisation.
+    #[test]
+    fn an_organization_name_is_kept_as_the_provider_wrote_it_once_it_is_safe() {
+        assert_eq!(sanitize_text("Example Inc").as_deref(), Some("Example Inc"));
+        assert_eq!(
+            sanitize_text("dev@example.com's Organization").as_deref(),
+            Some("dev@example.com's Organization")
+        );
+        assert_eq!(
+            sanitize_text("\u{1b}[31mEvil\u{202e}").as_deref(),
+            Some("[31mEvil")
+        );
+        // Long names are kept whole here; the column decides how much fits.
+        assert_eq!(sanitize_text(&"n".repeat(100)).unwrap().len(), 100);
+        assert_eq!(sanitize_text("   "), None);
     }
 
     #[test]
