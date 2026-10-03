@@ -464,18 +464,111 @@ pub fn open_in_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Puts `text` on the clipboard of the terminal the interface is drawn in.
+/// Where a copy went.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Copied {
+    /// The operating system's clipboard took it, and said so.
+    System,
+    /// Only handed to the terminal, to put on the clipboard of the machine it
+    /// runs on. Terminals that do not allow it ignore it without a word, so
+    /// whether it arrived cannot be known.
+    Terminal,
+}
+
+/// How long a clipboard program may take before it is given up on. The
+/// interface waits for it, so this is short.
+const CLIPBOARD_WAIT: Duration = Duration::from_secs(2);
+
+/// Puts `text` on the clipboard of the machine the user is sitting at.
 ///
-/// Done with the terminal's own clipboard sequence rather than the operating
-/// system's, so it lands on the machine the user is sitting at even when this
-/// one is at the other end of an SSH connection.
-pub fn copy_to_clipboard(text: &str) -> Result<()> {
+/// The terminal is always asked, with its own clipboard sequence (OSC 52):
+/// that is the one way to reach the user's clipboard when this machine is at
+/// the other end of an SSH connection. On this machine's own screen its
+/// clipboard program is run as well, since that one says whether it worked.
+pub fn copy_to_clipboard(text: &str) -> Result<Copied> {
+    let mut stdout = std::io::stdout();
+    let terminal = write!(stdout, "{}", clipboard_sequence(text))
+        .and_then(|()| stdout.flush())
+        .context("copying to the clipboard");
+    let programs = clipboard_programs(std::env::consts::OS, |name| std::env::var_os(name));
+    if programs
+        .into_iter()
+        .any(|(program, args)| pipe_to(program, args, text).is_ok())
+    {
+        return Ok(Copied::System);
+    }
+    terminal.map(|()| Copied::Terminal)
+}
+
+/// The sequence that asks a terminal to put `text` on its clipboard.
+fn clipboard_sequence(text: &str) -> String {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let mut stdout = std::io::stdout();
-    write!(stdout, "\u{1b}]52;c;{encoded}\u{7}")
-        .and_then(|()| stdout.flush())
-        .context("copying to the clipboard")
+    format!("\u{1b}]52;c;{encoded}\u{7}")
+}
+
+/// The programs that may put text on this machine's clipboard, most likely
+/// first, on operating system `os` with environment `env`.
+///
+/// None over SSH: this machine's clipboard is not the one the user can paste
+/// from.
+fn clipboard_programs(
+    os: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, &'static [&'static str])> {
+    let set = |name: &str| env(name).is_some_and(|value| !value.is_empty());
+    if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"].into_iter().any(set) {
+        return Vec::new();
+    }
+    match os {
+        "windows" => vec![("clip", &[])],
+        "macos" => vec![("pbcopy", &[])],
+        _ => {
+            let mut programs: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+            if set("WAYLAND_DISPLAY") {
+                programs.push(("wl-copy", &[]));
+            }
+            if set("DISPLAY") {
+                programs.push(("xclip", &["-selection", "clipboard"]));
+                programs.push(("xsel", &["--clipboard", "--input"]));
+            }
+            // Under WSL, the Windows clipboard.
+            programs.push(("clip.exe", &[]));
+            programs
+        }
+    }
+}
+
+/// Runs `program` with `text` as its input, and says whether it succeeded.
+fn pipe_to(program: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Waited for even when it would not take the text, so it is not left
+    // behind; its input is closed first, so it knows the text has ended.
+    let written = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(text.as_bytes()));
+    let deadline = Instant::now() + CLIPBOARD_WAIT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            written?;
+            if !status.success() {
+                bail!("{program} exited with {status}");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{program} did not finish");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +644,40 @@ mod tests {
         // A carriage return on its own rewrites the line, as a spinner does.
         transcript.push("⠋ working\r⠙ working\rfinished\n");
         assert_eq!(transcript.lines().last(), Some(&"finished"));
+    }
+
+    #[test]
+    fn the_terminal_is_asked_to_copy_the_text_whole() {
+        assert_eq!(
+            clipboard_sequence("https://example.com/?a=1&b=2"),
+            "\u{1b}]52;c;aHR0cHM6Ly9leGFtcGxlLmNvbS8/YT0xJmI9Mg==\u{7}"
+        );
+    }
+
+    /// On this machine's own screen its clipboard program is tried; over SSH
+    /// that clipboard is on the wrong machine, so only the terminal is asked.
+    #[test]
+    fn the_clipboard_program_suits_the_machine() {
+        let env = |vars: &'static [&'static str]| move |name: &str| vars.contains(&name).then(|| "1".into());
+        let names = |programs: Vec<(&'static str, &'static [&'static str])>| -> Vec<&'static str> {
+            programs.into_iter().map(|(program, _)| program).collect()
+        };
+
+        assert_eq!(names(clipboard_programs("macos", env(&[]))), ["pbcopy"]);
+        assert_eq!(names(clipboard_programs("windows", env(&[]))), ["clip"]);
+        assert_eq!(
+            names(clipboard_programs("linux", env(&["WAYLAND_DISPLAY", "DISPLAY"]))),
+            ["wl-copy", "xclip", "xsel", "clip.exe"]
+        );
+        // No display at all: only the Windows clipboard, should this be WSL.
+        assert_eq!(names(clipboard_programs("linux", env(&[]))), ["clip.exe"]);
+
+        for os in ["linux", "macos", "windows"] {
+            for ssh in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+                let over_ssh = move |name: &str| [ssh, "DISPLAY"].contains(&name).then(|| "1".into());
+                assert!(clipboard_programs(os, over_ssh).is_empty(), "{os} {ssh}");
+            }
+        }
     }
 
     #[test]

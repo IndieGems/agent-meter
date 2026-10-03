@@ -666,17 +666,43 @@ fn start_login(app: &mut App, engine: &Engine, provider: ProviderKind, account: 
     }
 }
 
-/// Keys while the login panel is up.
-///
+/// What a key does in the login panel, while the login is still running.
+#[derive(Debug, PartialEq)]
+enum LoginKey {
+    Cancel,
+    Open,
+    Copy,
+    Submit,
+    Erase,
+    Type(char),
+    Nothing,
+}
+
 /// While the CLI waits for a code every printable key is typing, so the link
 /// actions are on Ctrl; with no code wanted, the plain letters work too.
+/// `c` copies as it does in Claude Code's own login: with nothing typed yet,
+/// even while a code is wanted, since a code is pasted rather than typed and a
+/// paste does not arrive as keys.
+fn login_key_action(key: KeyEvent, typing: bool, typed_nothing: bool) -> LoginKey {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => LoginKey::Cancel,
+        KeyCode::Char('o') if control || !typing => LoginKey::Open,
+        KeyCode::Char('c') if !control && (!typing || typed_nothing) => LoginKey::Copy,
+        KeyCode::Char('y') if control || !typing => LoginKey::Copy,
+        KeyCode::Enter if typing => LoginKey::Submit,
+        KeyCode::Backspace if typing => LoginKey::Erase,
+        KeyCode::Char(c) if typing && !control => LoginKey::Type(c),
+        _ => LoginKey::Nothing,
+    }
+}
+
+/// Keys while the login panel is up.
 fn login_key(app: &mut App, key: KeyEvent) {
     let Some(login) = app.login.as_mut() else {
         app.mode = Mode::Browse;
         return;
     };
-    let control = key.modifiers.contains(KeyModifiers::CONTROL);
-    let typing = login.is_running() && login.wants_input();
 
     // Over and failed: the reason moves to the status line as it closes.
     if !login.is_running() && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
@@ -688,31 +714,41 @@ fn login_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    let result: Result<Option<&str>> = match key.code {
-        KeyCode::Esc => {
+    let typing = login.is_running() && login.wants_input();
+    let result: Result<Option<&str>> = match login_key_action(key, typing, login.input.is_empty()) {
+        LoginKey::Cancel => {
             login.cancel();
             Ok(None)
         }
-        KeyCode::Char('o') if control || !typing => match login.link() {
+        LoginKey::Open => match login.link() {
             Some(link) => {
                 login::open_in_browser(link).map(|()| Some("Opened the sign-in page in your browser"))
             }
             None => Ok(None),
         },
-        KeyCode::Char('y') if control || !typing => match login.link() {
-            Some(link) => login::copy_to_clipboard(link).map(|()| Some("Copied the sign-in link")),
-            None => Ok(None),
+        LoginKey::Copy => match login.link() {
+            Some(link) => login::copy_to_clipboard(link)
+                .map(|copied| {
+                    Some(match copied {
+                        login::Copied::System => "Copied the sign-in link",
+                        login::Copied::Terminal => {
+                            "Asked your terminal to copy the link; if it can't, select it above"
+                        }
+                    })
+                })
+                .context("Couldn't copy the sign-in link; select it above instead"),
+            None => Ok(Some("No sign-in link to copy yet")),
         },
-        KeyCode::Enter if typing => login.submit_input().map(|()| None),
-        KeyCode::Backspace if typing => {
+        LoginKey::Submit => login.submit_input().map(|()| None),
+        LoginKey::Erase => {
             login.input.pop();
             Ok(None)
         }
-        KeyCode::Char(c) if typing && !control => {
+        LoginKey::Type(c) => {
             login.input.push(c);
             Ok(None)
         }
-        _ => Ok(None),
+        LoginKey::Nothing => Ok(None),
     };
     match result {
         Ok(Some(note)) => app.note(note),
@@ -879,6 +915,51 @@ mod tests {
         assert_eq!(choose_provider_key(0, key(KeyCode::Char('9'))), Choice::Cancel);
         assert_eq!(choose_provider_key(0, key(KeyCode::Char('0'))), Choice::Cancel);
         assert_eq!(choose_provider_key(0, key(KeyCode::Esc)), Choice::Cancel);
+    }
+
+    /// `c` copies the link, as in Claude Code's own login, without taking a
+    /// letter from a code being typed; Ctrl keeps the link actions within
+    /// reach once one is.
+    #[test]
+    fn c_copies_the_link_unless_a_code_is_being_typed() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        let c = KeyCode::Char('c');
+
+        // No code wanted, or wanted and nothing typed yet.
+        assert_eq!(login_key_action(key(c), false, true), LoginKey::Copy);
+        assert_eq!(login_key_action(key(c), true, true), LoginKey::Copy);
+        // Part-way through typing one, `c` is part of it.
+        assert_eq!(login_key_action(key(c), true, false), LoginKey::Type('c'));
+
+        // The other ways to copy, as before.
+        assert_eq!(
+            login_key_action(key(KeyCode::Char('y')), false, true),
+            LoginKey::Copy
+        );
+        assert_eq!(
+            login_key_action(ctrl(KeyCode::Char('y')), true, false),
+            LoginKey::Copy
+        );
+        assert_eq!(
+            login_key_action(key(KeyCode::Char('y')), true, true),
+            LoginKey::Type('y')
+        );
+
+        // The keys `c` sits beside are unchanged.
+        assert_eq!(
+            login_key_action(key(KeyCode::Char('o')), false, true),
+            LoginKey::Open
+        );
+        assert_eq!(
+            login_key_action(key(KeyCode::Char('o')), true, true),
+            LoginKey::Type('o')
+        );
+        assert_eq!(login_key_action(key(KeyCode::Esc), true, false), LoginKey::Cancel);
+        assert_eq!(
+            login_key_action(key(KeyCode::Enter), true, false),
+            LoginKey::Submit
+        );
     }
 
     /// A job asked for while another runs is one the user wanted: after a

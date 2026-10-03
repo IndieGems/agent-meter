@@ -700,12 +700,16 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             Some(login) if login.wants_input() => vec![
                 ("enter", "submit code".into()),
                 ("ctrl+o", "open link".into()),
-                ("ctrl+y", "copy link".into()),
+                // Once a code is being typed, `c` is part of it.
+                (
+                    if login.input.is_empty() { "c" } else { "ctrl+y" },
+                    "copy link".into(),
+                ),
                 ("esc", "cancel".into()),
             ],
             _ => vec![
                 ("o", "open link".into()),
-                ("y", "copy link".into()),
+                ("c", "copy link".into()),
                 ("esc", "cancel".into()),
             ],
         },
@@ -1482,6 +1486,20 @@ mod tests {
             ),
         ));
         app
+    }
+
+    /// The footer names the key that copies the link: `c`, until a code is
+    /// being typed and `c` would be part of it.
+    #[test]
+    fn the_footer_says_how_to_copy_the_link() {
+        let mut app = signing_in();
+        let shown = render(&mut app, 100, 30);
+        assert!(shown.contains("c copy link"), "{shown}");
+
+        app.login.as_mut().unwrap().input.push_str("abc");
+        let shown = render(&mut app, 100, 30);
+        assert!(shown.contains("ctrl+y copy link"), "{shown}");
+        assert!(!shown.contains(" c copy link"), "{shown}");
     }
 
     /// Over SSH the browser that has to open the link is on another machine,
